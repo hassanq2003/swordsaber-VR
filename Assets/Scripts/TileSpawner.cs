@@ -7,17 +7,24 @@ public class TileSpawner : MonoBehaviour
     [SerializeField] private GameObject tilePrefab;
 
     [Header("Spawn")]
-    [SerializeField] private Transform spawnPoint;
+    [SerializeField] private Transform [] spawnPoint;
     [SerializeField] private Transform targetPoint;
-    [SerializeField] private float spawnGap = 1f;
 
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 5f;
 
+    [Header("Timing")]
+    [SerializeField] private float minimumGap = 0.31f;
+
     [Header("Song")]
     [SerializeField] private MidiJsonPlayer midiPlayer;
 
-    private int currentIndex;
+    private int spawnIndex;
+
+    private void Start()
+    {
+        StartSong();
+    }
 
     public void StartSong()
     {
@@ -29,55 +36,56 @@ public class TileSpawner : MonoBehaviour
 
         StopAllCoroutines();
 
-        currentIndex = 0;
+        spawnIndex = 0;
 
         StartCoroutine(SpawnRoutine());
     }
-    void Start()
-    {
-        StartSong();
-    }
+
     private IEnumerator SpawnRoutine()
     {
-        while (currentIndex < midiPlayer.song.notes.Length)
-        {
-            SpawnTile();
+        MidiNote[] notes = midiPlayer.song.notes;
 
-            yield return new WaitForSeconds(spawnGap);
+        while (spawnIndex < notes.Length)
+        {
+            SpawnTile(notes[spawnIndex]);
+
+            if (spawnIndex == notes.Length - 1)
+                break;
+
+            float gap = notes[spawnIndex + 1].time - notes[spawnIndex].time;
+
+            yield return new WaitForSeconds(Mathf.Max(minimumGap, gap));
+
+            spawnIndex++;
         }
     }
 
-    private void SpawnTile()
+    private void SpawnTile(MidiNote note)
     {
+        Transform s=spawnPoint[Random.Range(0, spawnPoint.Length)];
         GameObject obj = Instantiate(
             tilePrefab,
-            spawnPoint.position,
-            spawnPoint.rotation);
+            s.position,
+            s.rotation);
 
         PressableTile tile = obj.GetComponent<PressableTile>();
 
         tile.Initialize(
             targetPoint,
             moveSpeed,
-            midiPlayer.song.notes[currentIndex],
+            note,
             this);
     }
 
-    // Called by PressableTile when pressed
     public void TilePressed(PressableTile tile, MidiNote note)
     {
         midiPlayer.PlayNote(note.note, note.velocity);
 
-        currentIndex++;
-
         Destroy(tile.gameObject);
     }
 
-    // Called by PressableTile when it reaches the target
     public void TileMissed(PressableTile tile, MidiNote note)
     {
-        currentIndex++;
-
         Destroy(tile.gameObject);
     }
 }
