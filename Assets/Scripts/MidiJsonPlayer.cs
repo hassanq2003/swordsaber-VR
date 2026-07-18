@@ -8,6 +8,9 @@ public class MidiNote
     public int note;
     public int velocity;
     public float time;
+    public float duration;
+    public float end;
+    [System.NonSerialized] public int clipIndex;
 }
 
 [System.Serializable]
@@ -18,19 +21,39 @@ public class MidiSong
 
 public class MidiJsonPlayer : MonoBehaviour
 {
-    [Header("Settings")]
+    [Header("Background Audio")]
+    [SerializeField] private AudioSource backgroundAudioSource;
+
+    [Header("Volume")]
+    [Range(0f, 1f)]
+    public float backgroundVolume = 0.85f;
+    [Range(0f, 1f)]
+    public float noteVolume = 0.9f;
+
+    [Header("Note Release")]
+    [Range(0.1f, 2f)]
+    public float releaseTime = 0.5f;
+
+    [Header("Pool")]
     public int maxVoices = 36;
 
-    private AudioClip[] pianoNotes = new AudioClip[128];
-    private float[] notePitch = new float[128];        // Added for missing notes
+    private List<AudioClip> noteClips = new List<AudioClip>();
     private List<AudioSource> audioSources = new List<AudioSource>();
     public MidiSong song;
+
     private int current = 0;
     private bool isPlaying = false;
-
+    [Header("Note Combining")]
+[Range(0f, 2f)]
+public float combineThreshold = 0.15f;   // Seconds - notes closer than this will be combined
     void Awake()
     {
-        // Create AudioSource pool
+        if (backgroundAudioSource == null)
+            backgroundAudioSource = gameObject.AddComponent<AudioSource>();
+
+        backgroundAudioSource.playOnAwake = false;
+        backgroundAudioSource.loop = false;
+
         for (int i = 0; i < maxVoices; i++)
         {
             AudioSource src = gameObject.AddComponent<AudioSource>();
@@ -38,112 +61,118 @@ public class MidiJsonPlayer : MonoBehaviour
             audioSources.Add(src);
         }
 
-        AutoLoadPianoSamples();
-        LoadSong();
+        LoadAudioAndJSON();
     }
 
-    private void AutoLoadPianoSamples()
+   private void LoadAudioAndJSON()
+{
+    TextAsset jsonAsset = Resources.Load<TextAsset>("song");
+    if (jsonAsset == null)
     {
-        AudioClip[] loadedClips = Resources.LoadAll<AudioClip>("Piano");
-
-        // Reset arrays
-        for (int i = 0; i < 128; i++)
-        {
-            pianoNotes[i] = null;
-            notePitch[i] = 1f;
-        }
-
-        // Load real samples
-        foreach (AudioClip clip in loadedClips)
-        {
-            int midiNote = NoteNameToMidi(clip.name);
-            if (midiNote >= 0 && midiNote < 128)
-            {
-                pianoNotes[midiNote] = clip;
-                notePitch[midiNote] = 1f;        // Original pitch
-            }
-        }
-
-        PopulateMissingNotes();
-
-        Debug.Log($"Auto-loaded {loadedClips.Length} real samples and filled missing notes with pitch shifting.");
+        Debug.LogError("song.json not found!");
+        return;
     }
 
-    private void PopulateMissingNotes()
+    song = JsonUtility.FromJson<MidiSong>(jsonAsset.text);
+
+    if (song?.notes == null || song.notes.Length == 0)
     {
-        for (int target = 0; target < 128; target++)
+        Debug.LogError("No notes in JSON!");
+        return;
+    }
+
+    for (int ii = 0; ii < song.notes.Length; ii++)
+    {
+        MidiNote n = song.notes[ii];
+        n.time = n.time / 1000f;
+        n.duration = n.duration / 1000f;
+        n.end = n.end / 1000f;
+        n.clipIndex = ii;
+    }
+
+    System.Array.Sort(song.notes, (a, b) => a.time.CompareTo(b.time));
+
+    // Slice audio
+    noteClips.Clear();
+    AudioClip fullClip = backgroundAudioSource.clip ?? Resources.Load<AudioClip>("song");
+
+    if (fullClip == null)
+    {
+        Debug.LogError("song.wav not found!");
+        return;
+    }
+
+    float[] fullSamples = new float[fullClip.samples * fullClip.channels];
+    fullClip.GetData(fullSamples, 0);
+
+    int sampleRate = fullClip.frequency;
+    int channels = fullClip.channels;
+
+    int i = 0;
+    while (i < song.notes.Length)
+    {
+        MidiNote startNote = song.notes[i];
+        int startSample = Mathf.FloorToInt(startNote.time * sampleRate);
+        int endSample = Mathf.FloorToInt(startNote.end * sampleRate);
+
+        // Combine nearby notes if within threshold
+        int j = i + 1;
+        while (j < song.notes.Length && (song.notes[j].time - startNote.end) <= combineThreshold)
         {
-            if (pianoNotes[target] != null) 
-                continue;
+            endSample = Mathf.Max(endSample, Mathf.FloorToInt(song.notes[j].end * sampleRate));
+            j++;
+        }
 
-            int nearest = -1;
-            int bestDistance = int.MaxValue;
+        int sampleCount = endSample - startSample;
 
-            for (int sample = 0; sample < 128; sample++)
+        if (sampleCount > 0)
+        {
+            float[] noteSamples = new float[sampleCount * channels];
+            System.Array.Copy(fullSamples, startSample * channels, noteSamples, 0, noteSamples.Length);
+
+            // Fade out on the final combined clip
+            int fadeSamples = Mathf.FloorToInt(releaseTime * sampleRate);
+            fadeSamples = Mathf.Min(fadeSamples, sampleCount);
+
+            for (int k = 0; k < fadeSamples; k++)
             {
-                if (pianoNotes[sample] == null) continue;
-
-                int distance = Mathf.Abs(sample - target);
-                if (distance < bestDistance)
+                float fade = Mathf.SmoothStep(1f, 0f, (float)k / fadeSamples);
+                int sampleIdx = sampleCount - fadeSamples + k;
+                for (int ch = 0; ch < channels; ch++)
                 {
-                    bestDistance = distance;
-                    nearest = sample;
+                    int idx = sampleIdx * channels + ch;
+                    if (idx >= 0 && idx < noteSamples.Length)
+                        noteSamples[idx] *= fade;
                 }
             }
 
-            if (nearest != -1)
+            AudioClip clip = AudioClip.Create($"Combined_Note_{startNote.note}", sampleCount, channels, sampleRate, false);
+            clip.SetData(noteSamples, 0);
+            noteClips.Add(clip);
+
+            // Assign the same clipIndex to all combined notes
+            for (int k = i; k < j; k++)
             {
-                pianoNotes[target] = pianoNotes[nearest];
-                notePitch[target] = Mathf.Pow(2f, (target - nearest) / 12f);
+                song.notes[k].clipIndex = noteClips.Count - 1;
             }
         }
+
+        i = j;
     }
 
-    void LoadSong()
-    {
-        TextAsset json = Resources.Load<TextAsset>("song");
-        if (json == null)
-        {
-            Debug.LogError("song.json not found in Resources folder!");
-            return;
-        }
-
-        song = JsonUtility.FromJson<MidiSong>(json.text);
-        
-        if (song?.notes != null)
-        {
-            foreach (var n in song.notes)
-                n.time = n.time / 1000f;
-
-            System.Array.Sort(song.notes, (a, b) => a.time.CompareTo(b.time));
-            
-            Debug.Log($"Loaded {song.notes.Length} notes from JSON.");
-        }
-    }
-
-    void Update()
-    {
-        
-    }
+    Debug.Log($"Loaded {noteClips.Count} combined sliced clips.");
+}
 
     public void PlaySong()
     {
         if (song == null || isPlaying) return;
-        StartCoroutine(PlaySongCoroutine());
-    }
-
-    public void StopSong()
-    {
-        StopAllCoroutines();
-        isPlaying = false;
+        isPlaying = true;
         current = 0;
-        foreach (var src in audioSources) src.Stop();
+        StartCoroutine(PlaySongCoroutine());
     }
 
     private IEnumerator PlaySongCoroutine()
     {
-        isPlaying = true;
-        current = 0;
         float startTime = Time.time;
 
         while (current < song.notes.Length)
@@ -164,87 +193,75 @@ public class MidiJsonPlayer : MonoBehaviour
         if (current >= song.notes.Length) return;
 
         MidiNote n = song.notes[current];
-
-        if (n.note < 0 || n.note >= pianoNotes.Length || pianoNotes[n.note] == null)
-            return;
+        if (n.clipIndex < 0 || n.clipIndex >= noteClips.Count) return;
 
         AudioSource source = GetFreeSource();
         if (source == null) return;
 
-        float volume = Mathf.Clamp01(n.velocity / 127f) * 0.85f;
-
-        source.pitch = notePitch[n.note];           // Use correct pitch
-        source.PlayOneShot(pianoNotes[n.note], volume);
+        float volume = Mathf.Clamp01(n.velocity / 127f) * noteVolume;
+        source.PlayOneShot(noteClips[n.clipIndex], volume);
     }
 
     private AudioSource GetFreeSource()
     {
         foreach (var src in audioSources)
-            if (!src.isPlaying) return src;
+            if (!src.isPlaying)
+                return src;
         return null;
     }
 
-    public void PlayNextNote()
+    public void PlayNote(MidiNote note)
     {
-        if (current >= song.notes.Length) return;
-        PlayCurrentNote();
-        current++;
+        if (note == null || note.clipIndex < 0 || note.clipIndex >= noteClips.Count) return;
+
+        AudioSource source = GetFreeSource();
+        if (source == null) return;
+
+        float volume = Mathf.Clamp01(note.velocity / 127f) * noteVolume;
+        source.PlayOneShot(noteClips[note.clipIndex], volume);
+    }
+
+    // Called from TileSpawner
+    public void StartBackgroundMusic(float delay = 0f)
+    {
+        if (backgroundAudioSource == null || backgroundAudioSource.clip == null)
+        {
+            Debug.LogWarning("Background AudioSource or clip not assigned!");
+            return;
+        }
+
+        if (delay > 0f)
+            StartCoroutine(StartBackgroundAfterDelay(delay));
+        else
+            PlayBackgroundImmediately();
+    }
+
+    private IEnumerator StartBackgroundAfterDelay(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        PlayBackgroundImmediately();
+    }
+
+    private void PlayBackgroundImmediately()
+    {
+        if (backgroundAudioSource == null) return;
+
+        backgroundAudioSource.volume = backgroundVolume;
+        backgroundAudioSource.Play();
+        Debug.Log("Background music started.");
+    }
+
+    public void StopSong()
+    {
+        StopAllCoroutines();
+        isPlaying = false;
+        current = 0;
+
+        if (backgroundAudioSource != null) backgroundAudioSource.Stop();
     }
 
     public void ResetSong()
     {
         StopSong();
     }
-
-    // Convert "C4", "Ab3", etc. to MIDI number
-    private int NoteNameToMidi(string name)
-    {
-        if (string.IsNullOrEmpty(name)) return -1;
-
-        string n = name.Trim().ToUpper();
-        int octave = 0;
-
-        for (int i = n.Length - 1; i >= 0; i--)
-        {
-            if (char.IsDigit(n[i]))
-            {
-                octave = int.Parse(n.Substring(i));
-                n = n.Substring(0, i);
-                break;
-            }
-        }
-
-        int baseNote = n switch
-        {
-            "C" => 0,
-            "C#" or "DB" => 1,
-            "D" => 2,
-            "D#" or "EB" => 3,
-            "E" => 4,
-            "F" => 5,
-            "F#" or "GB" => 6,
-            "G" => 7,
-            "G#" or "AB" => 8,
-            "A" => 9,
-            "A#" or "BB" => 10,
-            "B" => 11,
-            _ => -1
-        };
-
-        return baseNote + (octave * 12);
-    }
-    public void PlayNote(int midiNote, int velocity)
-{
-    if (midiNote < 0 || midiNote >= pianoNotes.Length || pianoNotes[midiNote] == null)
-        return;
-
-    // Use your existing logic with pitch if needed
-    AudioSource source = GetFreeSource(); // reuse your pool
-    if (source != null)
-    {
-        float volume = Mathf.Clamp01(velocity / 127f) * 0.85f;
-        source.pitch = notePitch[midiNote];
-        source.PlayOneShot(pianoNotes[midiNote], volume);
-    }
-}
 }
